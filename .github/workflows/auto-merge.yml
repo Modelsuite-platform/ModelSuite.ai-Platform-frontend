@@ -39,7 +39,16 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    # Dependabot is excluded on purpose: its PRs are mostly version bumps,
+    # including majors, and this workflow checks for conflicts rather than for
+    # green tests - so an unattended merge of one would put untested upgrades
+    # straight onto the default branch. startsWith also covers
+    # dependabot-preview[bot]. workflow_dispatch stays available as a manual
+    # override for a bump that has been looked at.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+       !startsWith(github.event.pull_request.user.login, 'dependabot'))
     runs-on: ubuntu-latest
     env:
       PR: ${{ github.event.pull_request.number || inputs.pr }}
