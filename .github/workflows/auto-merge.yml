@@ -1,0 +1,176 @@
+name: auto-merge
+
+# Every pull request is checked for merge conflicts and then merged
+# immediately.
+#
+# Three outcomes:
+#   1. The head branch merges cleanly     -> merged right away.
+#   2. The base moved ahead but git can   -> the base is merged into the head
+#      still reconcile the two               branch, pushed, then merged.
+#   3. A real content conflict            -> Claude resolves it when
+#                                            ANTHROPIC_API_KEY is set;
+#                                            otherwise the PR gets a
+#                                            "conflict" label and a comment
+#                                            and the run fails. Nothing is
+#                                            ever merged blindly.
+#
+# pull_request_target, not pull_request, so the workflow definition always
+# comes from the base branch and secrets are available: a PR cannot edit this
+# file to change the rules it is judged by.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to process"
+        required: true
+
+concurrency:
+  # One run per PR, and deliberately not cancel-in-progress: a cancelled run
+  # can leave a half-resolved conflict pushed to the head branch.
+  group: auto-merge-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.pull_request.number || inputs.pr }}
+      # MERGE_TOKEN is a PAT. With the default GITHUB_TOKEN the resulting push
+      # to the base branch does not trigger any other workflow, so deploy and
+      # build jobs listening on `push` would silently never run.
+      GH_TOKEN: ${{ secrets.MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Set to "true" to also require green checks before merging.
+      WAIT_FOR_CHECKS: "false"
+      MERGE_METHOD: "squash"
+
+    steps:
+      - name: Read PR state
+        id: pr
+        run: |
+          set -euo pipefail
+          # GitHub computes `mergeable` in the background and reports null
+          # while that runs, so poll instead of trusting the first read.
+          for i in $(seq 1 12); do
+            data=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+            state=$(jq -r '.state' <<<"$data")
+            merged=$(jq -r '.merged' <<<"$data")
+            mergeable=$(jq -r '.mergeable // "null"' <<<"$data")
+            if [ "$state" != "open" ] || [ "$merged" = "true" ]; then
+              echo "PR #$PR is no longer open (state=$state merged=$merged)."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$mergeable" != "null" ] && break
+            sleep 5
+          done
+          {
+            echo "skip=false"
+            echo "mergeable=$mergeable"
+            echo "base=$(jq -r '.base.ref' <<<"$data")"
+            echo "cross_repo=$(jq -r '.head.repo.full_name != .base.repo.full_name' <<<"$data")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the head branch
+        if: steps.pr.outputs.skip != 'true' && steps.pr.outputs.mergeable != 'true'
+        uses: actions/checkout@v4
+        with:
+          # Full history: a merge needs the common ancestor, which a shallow
+          # clone does not have.
+          fetch-depth: 0
+          token: ${{ secrets.MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Merge the base branch into the head branch
+        id: reconcile
+        if: steps.pr.outputs.skip != 'true' && steps.pr.outputs.mergeable != 'true'
+        env:
+          BASE: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh pr checkout "$PR"
+          git fetch origin "$BASE"
+          if git merge --no-edit "origin/$BASE"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            echo "Conflicting files:"
+            cat /tmp/conflicts.txt
+          fi
+
+      - name: Let Claude resolve the conflict
+        if: steps.reconcile.outputs.conflict == 'true' && env.ANTHROPIC_API_KEY != ''
+        env:
+          BASE: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'This repository is mid-merge of branch %s into the pull request branch and the merge stopped on conflicts. Resolve every conflict in these files:\n\n' "$BASE"
+            cat /tmp/conflicts.txt
+            printf '\nKeep the intent of BOTH sides. The PR branch carries the new work; the base carries what landed since the PR was opened. Neither side may be discarded wholesale. Remove every conflict marker and leave each file in a state that parses. Do not run git commands that change state (no add, commit, merge, checkout, reset) - only edit files. If a conflict cannot be resolved without a product decision, leave its markers in place rather than guessing.\n'
+          } > /tmp/prompt.txt
+          npx -y @anthropic-ai/claude-code@latest \
+            --permission-mode acceptEdits \
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*)" \
+            -p "$(cat /tmp/prompt.txt)"
+          # Trust nothing: verify the markers are actually gone before committing.
+          if git grep -nI -e '^<<<<<<< ' -e '^>>>>>>> ' -- $(cat /tmp/conflicts.txt); then
+            echo "::error::Conflict markers are still present - not merging."
+            exit 1
+          fi
+          git add -A
+          printf 'merge %s into %s\n\nConflicts resolved automatically by Claude.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n' \
+            "$BASE" "$(git rev-parse --abbrev-ref HEAD)" > /tmp/msg.txt
+          git commit -F /tmp/msg.txt
+
+      - name: Report an unresolved conflict
+        if: steps.reconcile.outputs.conflict == 'true' && env.ANTHROPIC_API_KEY == ''
+        env:
+          BASE: ${{ steps.pr.outputs.base }}
+        run: |
+          set -euo pipefail
+          gh label create conflict --color B60205 --description "Merge conflict with the base branch" 2>/dev/null || true
+          gh pr edit "$PR" --add-label conflict || true
+          {
+            printf 'Auto-merge stopped: this PR conflicts with `%s` in:\n\n```\n' "$BASE"
+            cat /tmp/conflicts.txt
+            printf '```\n\nGit cannot reconcile these on its own. Resolve them by hand, or add an `ANTHROPIC_API_KEY` secret to this repository so the workflow can resolve them automatically.\n'
+          } > /tmp/comment.md
+          gh pr comment "$PR" --body-file /tmp/comment.md
+          exit 1
+
+      - name: Push the reconciled head branch
+        if: steps.pr.outputs.skip != 'true' && steps.pr.outputs.mergeable != 'true'
+        run: |
+          set -euo pipefail
+          if git push; then
+            exit 0
+          fi
+          if [ "${{ steps.pr.outputs.cross_repo }}" = "true" ]; then
+            # Fork branches are only pushable when the author allowed maintainer
+            # edits; say so plainly instead of failing on a bare git error.
+            gh pr comment "$PR" --body 'Auto-merge could not update this fork branch. Enable "Allow edits by maintainers" on the PR, or update the branch yourself.'
+          fi
+          exit 1
+
+      - name: Merge
+        if: steps.pr.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          args=(--delete-branch)
+          [ "$WAIT_FOR_CHECKS" = "true" ] && args+=(--auto)
+          # Repos differ in which merge methods they allow, so fall back rather
+          # than leaving a green run with an unmerged PR behind.
+          gh pr merge "$PR" "--$MERGE_METHOD" "${args[@]}" \
+            || gh pr merge "$PR" --merge "${args[@]}" \
+            || gh pr merge "$PR" --rebase "${args[@]}"
